@@ -1,773 +1,775 @@
 import logging
 import os
 import pytz
-from datetime import datetime, time, timedelta, date
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    ContextTypes, filters, CallbackQueryHandler,
+    PreCheckoutQueryHandler
 )
 
 from database import (
-    init_db, add_user, get_user, get_all_user_ids,
-    add_points, reset_weekly_points, log_weekly_reward,
-    set_today_challenge_fixed, get_today_challenge,
-    lock_today_challenge, settle_challenge,
-    submit_prediction, update_prediction,
-    get_today_prediction, get_all_today_predictions,
-    save_prediction_points, get_user_prediction_history,
-    get_all_time_leaderboard, get_weekly_leaderboard,
-    get_user_rank
+    init_db, add_user, get_user, is_premium, is_banned,
+    set_premium, remove_premium, ban_user, unban_user,
+    get_predictions_today, has_predicted_stock_today,
+    add_prediction, get_user_predictions_today,
+    get_all_predictions_for_date, evaluate_prediction,
+    update_user_points, get_weekly_leaderboard,
+    get_user_weekly_rank, reset_weekly_points,
+    save_weekly_winners, get_all_user_ids,
+    get_all_users, get_stats
 )
-from price_checker import get_stock_price, get_closing_price
-from points import calculate_points, points_breakdown_text
 
-# ─── SETUP ───────────────────────────────────────────
-load_dotenv()
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+from market import (
+    get_all_closing_prices, is_market_open,
+    is_prediction_window_open, get_next_trading_date,
+    calculate_points, STOCKS
 )
-logger = logging.getLogger(__name__)
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID  = int(os.getenv("ADMIN_ID", "0"))
-IST       = pytz.timezone("Asia/Kolkata")
+ADMIN_ID = 6845468120
+IST = pytz.timezone("Asia/Kolkata")
+PREMIUM_STARS = 50
 
-WEEKLY_PRIZES = {1: 100, 2: 50, 3: 25}
+user_state = {}
+admin_broadcast_mode = {}
 
-# ─── HELPERS ─────────────────────────────────────────
+# -------------------- KEYBOARDS --------------------
 
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-def medal(rank: int) -> str:
-    return {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"#{rank}")
-
-def display_name(user: dict) -> str:
-    return user.get("first_name") or user.get("username") or "User"
-
-# ─── KEYBOARDS ───────────────────────────────────────
-
-def main_menu():
+def main_menu_keyboard(user_id):
+    premium = is_premium(user_id)
+    plan = "Premium" if premium else "Free"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎯 Predict Today", callback_data="predict"),
-            InlineKeyboardButton("📊 My Stats",      callback_data="stats"),
+            InlineKeyboardButton("Predict Today", callback_data="predict"),
+            InlineKeyboardButton("My Predictions", callback_data="mypredictions"),
         ],
         [
-            InlineKeyboardButton("🏆 Leaderboard",   callback_data="leaderboard"),
-            InlineKeyboardButton("📅 My History",    callback_data="history"),
+            InlineKeyboardButton("Leaderboard", callback_data="leaderboard"),
+            InlineKeyboardButton("My Rank", callback_data="myrank"),
         ],
         [
-            InlineKeyboardButton("❓ How It Works",  callback_data="howto"),
+            InlineKeyboardButton("How to Play", callback_data="howtoplay"),
+            InlineKeyboardButton(f"Plan: {plan}", callback_data="premium"),
         ],
     ])
 
-def back_menu():
+def back_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        [InlineKeyboardButton("Back to Menu", callback_data="menu_main")]
     ])
 
-# ─── /start ──────────────────────────────────────────
+def stock_keyboard(user_id, prediction_date):
+    buttons = []
+    for symbol in STOCKS:
+        already = has_predicted_stock_today(user_id, symbol, prediction_date)
+        label = f"{symbol} (done)" if already else symbol
+        buttons.append([InlineKeyboardButton(label, callback_data=f"stock_{symbol}")])
+    buttons.append([InlineKeyboardButton("Cancel", callback_data="menu_main")])
+    return InlineKeyboardMarkup(buttons)
+
+# -------------------- START --------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    add_user(user.id, user.username, user.first_name)
+    add_user(user.id, user.username, user.first_name, user.last_name)
 
-    challenge  = get_today_challenge()
-    stock_line = (
-        f"📌 Today's stock: *{challenge['symbol']}*"
-        + (" _(locked)_" if challenge["is_locked"] else "")
-        if challenge else "⏳ Today's stock not announced yet!"
-    )
+    if is_banned(user.id):
+        await update.message.reply_text("You are banned from StockTap.")
+        return
+
+    premium = is_premium(user.id)
+    market_open = is_market_open()
+    next_date = get_next_trading_date()
+
+    if market_open:
+        status = "Market is LIVE - No predictions accepted now"
+    else:
+        status = f"Prediction window OPEN for {next_date}"
+
+    plan = "PREMIUM - 2 predictions/day" if premium else "FREE - 1 prediction/day"
 
     await update.message.reply_text(
-        f"Namaste *{user.first_name}*! 🙏\n\n"
-        "Welcome to *StockPredictor* 📈\n"
-        "Predict closing prices → earn points → win *⭐ Stars*!\n\n"
-        f"{stock_line}\n\n"
-        "🎯 Exact match = *1000 pts*\n"
-        "📅 Deadline: *9:00 AM IST* daily\n\n"
-        "👇 Choose an option:",
-        parse_mode="Markdown",
-        reply_markup=main_menu()
+        f"Welcome to StockTap!\n\n"
+        f"Predict NSE closing prices and win Stars!\n\n"
+        f"Status: {status}\n"
+        f"Plan: {plan}\n\n"
+        f"How it works:\n"
+        f"Predict closing price of NIFTY, BANKNIFTY or SENSEX\n"
+        f"Closer your prediction = More points\n"
+        f"Top 3 weekly winners get Telegram Stars!\n\n"
+        f"Choose an option:",
+        reply_markup=main_menu_keyboard(user.id)
     )
 
-# ─── CALLBACK ROUTER ─────────────────────────────────
+# -------------------- CALLBACKS --------------------
 
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    data    = query.data
+    data = query.data
 
-    # ── MAIN MENU ──
-    if data == "main_menu":
-        challenge  = get_today_challenge()
-        stock_line = (
-            f"📌 Today: *{challenge['symbol']}*"
-            + (" _(locked)_" if challenge["is_locked"] else "")
-            if challenge else "⏳ No stock announced yet"
-        )
+    if is_banned(user_id):
+        await query.edit_message_text("You are banned from StockTap.")
+        return
+
+    # MAIN MENU
+    if data == "menu_main":
+        premium = is_premium(user_id)
+        market_open = is_market_open()
+        next_date = get_next_trading_date()
+
+        if market_open:
+            status = "Market is LIVE - No predictions accepted"
+        else:
+            status = f"Prediction window OPEN for {next_date}"
+
+        plan = "PREMIUM - 2 predictions/day" if premium else "FREE - 1 prediction/day"
+
         await query.edit_message_text(
-            f"🏠 *Main Menu*\n\n{stock_line}\n\nChoose an option 👇",
-            parse_mode="Markdown",
-            reply_markup=main_menu()
+            f"StockTap Main Menu\n\n"
+            f"Status: {status}\n"
+            f"Plan: {plan}\n\n"
+            f"Choose an option:",
+            reply_markup=main_menu_keyboard(user_id)
         )
 
-    # ── PREDICT ──
+    # PREDICT
     elif data == "predict":
-        await handle_predict_callback(query, context)
-
-    # ── EDIT PREDICTION ──
-    elif data == "edit_prediction":
-        challenge = get_today_challenge()
-        if not challenge or challenge["is_locked"]:
+        if is_market_open():
             await query.edit_message_text(
-                "⏰ *Predictions are locked!*\nMarket is open — no more changes.",
-                parse_mode="Markdown", reply_markup=back_menu()
+                "Market is currently OPEN!\n\n"
+                "No predictions accepted during market hours.\n"
+                "Market closes at 3:30 PM IST.\n\n"
+                "Come back after 3:30 PM to predict tomorrow!",
+                reply_markup=back_keyboard()
             )
             return
-        context.user_data["editing"] = True
-        await query.edit_message_text(
-            f"✏️ *Edit Your Prediction*\n\n"
-            f"Stock: *{challenge['symbol']}*\n\n"
-            "Send your new predicted closing price 👇\n"
-            "_(Numbers only, e.g. `24500.50`)_",
-            parse_mode="Markdown"
-        )
 
-    # ── STATS ──
-    elif data == "stats":
-        user = get_user(user_id)
-        if not user:
-            await query.edit_message_text("Please /start first.")
-            return
-        rank = get_user_rank(user_id)
-        pred = get_today_prediction(user_id)
-        pred_line = (
-            f"🎯 Today's prediction: *₹{pred['predicted_price']}*"
-            if pred else "🎯 Today: _Not predicted yet_"
-        )
-        await query.edit_message_text(
-            f"📊 *Your Stats*\n\n"
-            f"👤 Name: *{display_name(user)}*\n"
-            f"🏅 All-time rank: *#{rank['all_time']}*\n"
-            f"📅 Weekly rank: *#{rank['weekly']}*\n\n"
-            f"⭐ Total points: *{user['total_points']}*\n"
-            f"📆 Weekly points: *{user['weekly_points']}*\n"
-            f"🎮 Total predictions: *{user['total_predictions']}*\n\n"
-            f"{pred_line}",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📅 My History", callback_data="history")],
-                [InlineKeyboardButton("🏠 Main Menu",  callback_data="main_menu")],
-            ])
-        )
+        next_date = get_next_trading_date()
+        premium = is_premium(user_id)
+        limit = 2 if premium else 1
+        used = get_predictions_today(user_id, next_date)
 
-    # ── LEADERBOARD ──
-    elif data == "leaderboard":
-        await show_leaderboard(query)
-
-    elif data == "leaderboard_weekly":
-        await show_weekly_leaderboard(query)
-
-    elif data == "leaderboard_alltime":
-        await show_leaderboard(query)
-
-    # ── HISTORY ──
-    elif data == "history":
-        history = get_user_prediction_history(user_id, limit=7)
-        if not history:
+        if used >= limit:
+            plan = "Premium (2/day)" if premium else "Free (1/day)"
             await query.edit_message_text(
-                "📅 *No history yet!*\n\nStart predicting to see results here.",
-                parse_mode="Markdown", reply_markup=back_menu()
-            )
-            return
-
-        text = "📅 *Your Last 7 Predictions:*\n\n"
-        for h in history:
-            pts       = h["points_earned"]
-            closing   = h["closing_price"]
-            pts_str   = f"*{pts} pts*" if pts is not None else "_pending_"
-            close_str = f"₹{closing}"  if closing           else "_pending_"
-            text += (
-                f"📌 *{h['symbol']}* | {h['challenge_date']}\n"
-                f"   Guess: ₹{h['predicted_price']} | Close: {close_str}\n"
-                f"   Points: {pts_str}\n\n"
-            )
-
-        await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=back_menu()
-        )
-
-    # ── HOW IT WORKS ──
-    elif data == "howto":
-        await query.edit_message_text(
-            "❓ *How StockPredictor Works*\n\n"
-            "1️⃣ Admin announces today's stock daily\n"
-            "2️⃣ You predict the *closing price* before *9:00 AM IST*\n"
-            "3️⃣ Market closes at *3:30 PM IST*\n"
-            "4️⃣ Points awarded based on accuracy\n"
-            "5️⃣ Top 3 each week win *⭐ Telegram Stars*!\n\n"
-            + points_breakdown_text() + "\n\n"
-            "🏆 *Weekly Prizes:*\n"
-            "🥇 1st → *100 ⭐ Stars*\n"
-            "🥈 2nd → *50 ⭐ Stars*\n"
-            "🥉 3rd → *25 ⭐ Stars*\n\n"
-            "🔄 Week resets every *Monday 12 AM IST*",
-            parse_mode="Markdown", reply_markup=back_menu()
-        )
-
-# ─── PREDICT FLOW ─────────────────────────────────────
-
-async def handle_predict_callback(query, context):
-    user_id   = query.from_user.id
-    challenge = get_today_challenge()
-
-    if not challenge:
-        await query.edit_message_text(
-            "⏳ *No stock announced today!*\n\nCome back later.",
-            parse_mode="Markdown", reply_markup=back_menu()
-        )
-        return
-
-    if challenge["is_locked"]:
-        existing = get_today_prediction(user_id)
-        pts_line = ""
-        if existing and existing["points_earned"] is not None:
-            pts_line = f"\n✅ You earned *{existing['points_earned']} pts* today!"
-        elif existing:
-            pts_line = "\n⏳ Awaiting market close for results."
-
-        await query.edit_message_text(
-            f"🔒 *Predictions Locked!*\n\n"
-            f"Stock: *{challenge['symbol']}*\n"
-            f"{'Your prediction: ₹' + str(existing['predicted_price']) if existing else '⚠️ You did not predict today.'}"
-            f"{pts_line}",
-            parse_mode="Markdown", reply_markup=back_menu()
-        )
-        return
-
-    existing = get_today_prediction(user_id)
-    if existing:
-        await query.edit_message_text(
-            f"✅ *Already Predicted Today!*\n\n"
-            f"Stock: *{challenge['symbol']}*\n"
-            f"Your prediction: *₹{existing['predicted_price']}*\n\n"
-            "You can edit until *9:00 AM IST* 👇",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Edit Prediction", callback_data="edit_prediction")],
-                [InlineKeyboardButton("🏠 Main Menu",       callback_data="main_menu")],
-            ])
-        )
-        return
-
-    live = get_stock_price(challenge["symbol"])
-    hint = f"\n💰 Current price: *₹{live}*" if live else ""
-
-    await query.edit_message_text(
-        f"🎯 *Predict Closing Price*\n\n"
-        f"Stock: *{challenge['symbol']}*{hint}\n\n"
-        "Send your predicted *closing price* 👇\n"
-        "_(Numbers only, e.g. `24500.50`)_\n\n"
-        "⏰ Deadline: *9:00 AM IST*",
-        parse_mode="Markdown"
-    )
-    context.user_data["expecting_prediction"] = True
-
-# ─── TEXT MESSAGE HANDLER ─────────────────────────────
-
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user    = update.effective_user
-    user_id = user.id
-    text    = update.message.text.strip()
-
-    add_user(user_id, user.username, user.first_name)
-
-    if context.user_data.get("expecting_prediction") or context.user_data.get("editing"):
-        try:
-            price = float(text.replace(",", "").replace("₹", "").strip())
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Invalid number!\nSend like `24500` or `24500.50`",
-                parse_mode="Markdown"
-            )
-            return
-
-        editing = context.user_data.pop("editing", False)
-        context.user_data.pop("expecting_prediction", None)
-
-        challenge = get_today_challenge()
-        if not challenge:
-            await update.message.reply_text("⏳ No challenge today!", reply_markup=main_menu())
-            return
-        if challenge["is_locked"]:
-            await update.message.reply_text(
-                "🔒 *Predictions are locked!*",
-                parse_mode="Markdown", reply_markup=main_menu()
-            )
-            return
-
-        if editing:
-            update_prediction(user_id, price)
-            await update.message.reply_text(
-                f"✅ *Prediction Updated!*\n\n"
-                f"Stock: *{challenge['symbol']}*\n"
-                f"New guess: *₹{price}*\n\nGood luck! 🍀",
-                parse_mode="Markdown", reply_markup=main_menu()
-            )
-            return
-
-        success, reason = submit_prediction(user_id, price)
-
-        if success:
-            await update.message.reply_text(
-                f"✅ *Prediction Submitted!*\n\n"
-                f"Stock: *{challenge['symbol']}*\n"
-                f"Your guess: *₹{price}*\n\n"
-                "Results after 3:30 PM IST 📊\nGood luck! 🍀",
-                parse_mode="Markdown", reply_markup=main_menu()
-            )
-        elif reason == "duplicate":
-            pred = get_today_prediction(user_id)
-            await update.message.reply_text(
-                f"⚠️ Already predicted *₹{pred['predicted_price']}* today!\n"
-                "Use ✏️ Edit to change it.",
-                parse_mode="Markdown",
+                f"You have used all your predictions for today!\n\n"
+                f"Plan: {plan}\n"
+                f"Used: {used}/{limit}\n\n"
+                f"Upgrade to Premium for 2 predictions/day!\n"
+                f"Use /premium to upgrade.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✏️ Edit Prediction", callback_data="edit_prediction")],
-                    [InlineKeyboardButton("🏠 Main Menu",       callback_data="main_menu")],
+                    [InlineKeyboardButton("Get Premium", callback_data="premium")],
+                    [InlineKeyboardButton("Back to Menu", callback_data="menu_main")]
                 ])
             )
-        elif reason == "locked":
-            await update.message.reply_text("🔒 Predictions locked!", reply_markup=main_menu())
-        else:
-            await update.message.reply_text("❌ Error. Try again.", reply_markup=main_menu())
+            return
+
+        remaining = limit - used
+        await query.edit_message_text(
+            f"Select stock to predict for {next_date}:\n\n"
+            f"Predictions remaining: {remaining}/{limit}\n\n"
+            f"Already predicted stocks are marked (done):",
+            reply_markup=stock_keyboard(user_id, next_date)
+        )
+
+    # STOCK SELECTED
+    elif data.startswith("stock_"):
+        if is_market_open():
+            await query.edit_message_text(
+                "Market is open! No predictions accepted.",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        symbol = data.replace("stock_", "")
+        next_date = get_next_trading_date()
+
+        if has_predicted_stock_today(user_id, symbol, next_date):
+            await query.edit_message_text(
+                f"You already predicted {symbol} for {next_date}!\n\n"
+                f"Choose a different stock.",
+                reply_markup=stock_keyboard(user_id, next_date)
+            )
+            return
+
+        user_state[user_id] = {
+            "step": "waiting_price",
+            "symbol": symbol,
+            "date": next_date
+        }
+
+        await query.edit_message_text(
+            f"Enter your predicted closing price for {symbol}\n\n"
+            f"Date: {next_date}\n\n"
+            f"Type the price below (numbers only)\n"
+            f"Example: 22500 or 22500.50"
+        )
+
+    # MY PREDICTIONS
+    elif data == "mypredictions":
+        next_date = get_next_trading_date()
+        predictions = get_user_predictions_today(user_id, next_date)
+
+        if not predictions:
+            await query.edit_message_text(
+                f"No predictions yet for {next_date}!\n\n"
+                f"Market is {'OPEN - wait till 3:30 PM' if is_market_open() else 'CLOSED - predict now!'}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Predict Now", callback_data="predict")],
+                    [InlineKeyboardButton("Back to Menu", callback_data="menu_main")]
+                ])
+            )
+            return
+
+        text = f"Your predictions for {next_date}:\n\n"
+        for p in predictions:
+            status = "Evaluated" if p["is_evaluated"] else "Pending result"
+            points = f"{p['points_earned']} pts" if p["is_evaluated"] else "Waiting..."
+            text += (
+                f"Stock: {p['stock_symbol']}\n"
+                f"Your prediction: Rs {p['predicted_price']}\n"
+                f"Actual price: {'Rs ' + str(p['actual_price']) if p['actual_price'] else 'Not yet'}\n"
+                f"Points: {points}\n"
+                f"Status: {status}\n\n"
+            )
+
+        await query.edit_message_text(
+            text,
+            reply_markup=back_keyboard()
+        )
+
+    # LEADERBOARD
+    elif data == "leaderboard":
+        leaders = get_weekly_leaderboard()
+
+        if not leaders:
+            await query.edit_message_text(
+                "No predictions made this week yet!\n\n"
+                "Be the first to predict!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Predict Now", callback_data="predict")],
+                    [InlineKeyboardButton("Back to Menu", callback_data="menu_main")]
+                ])
+            )
+            return
+
+        text = "Weekly Leaderboard\n\n"
+        medals = ["1", "2", "3"]
+        for i, leader in enumerate(leaders):
+            name = leader["first_name"] or leader["username"] or "Unknown"
+            username = f"@{leader['username']}" if leader["username"] else ""
+            medal = medals[i] if i < 3 else str(i + 1)
+            text += f"{medal}. {name} {username}\n"
+            text += f"   Points: {round(leader['weekly_points'], 2)}\n\n"
+
+        text += "\nTop 3 win Telegram Stars every Sunday!"
+
+        user_rank = get_user_weekly_rank(user_id)
+        user = get_user(user_id)
+        text += f"\nYour rank: #{user_rank}"
+        text += f"\nYour points: {round(user['weekly_points'], 2)}"
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Predict Now", callback_data="predict")],
+                [InlineKeyboardButton("Back to Menu", callback_data="menu_main")]
+            ])
+        )
+
+    # MY RANK
+    elif data == "myrank":
+        user = get_user(user_id)
+        rank = get_user_weekly_rank(user_id)
+        next_date = get_next_trading_date()
+        predictions_today = get_predictions_today(user_id, next_date)
+        premium = is_premium(user_id)
+        limit = 2 if premium else 1
+
+        await query.edit_message_text(
+            f"Your Stats\n\n"
+            f"Weekly rank: #{rank}\n"
+            f"Weekly points: {round(user['weekly_points'], 2)}\n"
+            f"Total points: {round(user['total_points'], 2)}\n"
+            f"Total predictions: {user['predictions_made']}\n\n"
+            f"Today: {predictions_today}/{limit} predictions used\n"
+            f"Plan: {'Premium' if premium else 'Free'}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("View Leaderboard", callback_data="leaderboard")],
+                [InlineKeyboardButton("Back to Menu", callback_data="menu_main")]
+            ])
+        )
+
+    # HOW TO PLAY
+    elif data == "howtoplay":
+        await query.edit_message_text(
+            "How to Play StockTap\n\n"
+            "1. Market closes at 3:30 PM\n"
+            "2. Predict tomorrow's closing price\n"
+            "   for NIFTY, BANKNIFTY or SENSEX\n"
+            "3. Predictions accepted until 9:14 AM\n"
+            "4. Market opens 9:15 AM - no more predictions\n"
+            "5. Results announced at 3:31 PM\n\n"
+            "Points System:\n"
+            "Perfect prediction = 100 points\n"
+            "0.5% off = 90 points\n"
+            "1% off = 80 points\n"
+            "2% off = 60 points\n"
+            "5%+ off = 0 points\n\n"
+            "Weekly Prizes:\n"
+            "Rank 1 = 100 Telegram Stars\n"
+            "Rank 2 = 50 Telegram Stars\n"
+            "Rank 3 = 25 Telegram Stars\n\n"
+            "Free plan: 1 prediction/day\n"
+            "Premium plan: 2 predictions/day + 1.5x points",
+            reply_markup=back_keyboard()
+        )
+
+    # PREMIUM
+    elif data == "premium":
+        if is_premium(user_id):
+            await query.edit_message_text(
+                "You are already a Premium member!\n\n"
+                "Enjoying 2 predictions/day and 1.5x points!",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        await query.edit_message_text(
+            "StockTap Premium\n\n"
+            "Free plan:\n"
+            "- 1 prediction per day\n"
+            "- Normal points\n\n"
+            "Premium plan (50 Stars):\n"
+            "- 2 predictions per day\n"
+            "- 1.5x points multiplier\n"
+            "- Priority results notification\n\n"
+            "One time payment - 50 Telegram Stars\n\n"
+            "Click below to upgrade:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Pay 50 Stars", callback_data="pay_premium")],
+                [InlineKeyboardButton("Back to Menu", callback_data="menu_main")]
+            ])
+        )
+
+    elif data == "pay_premium":
+        await context.bot.send_invoice(
+            chat_id=query.from_user.id,
+            title="StockTap Premium",
+            description="2 predictions/day + 1.5x points multiplier",
+            payload="stocktap_premium",
+            currency="XTR",
+            prices=[LabeledPrice("Premium Plan", PREMIUM_STARS)],
+        )
+
+# -------------------- MESSAGE HANDLER --------------------
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if is_banned(user_id):
+        await update.message.reply_text("You are banned from StockTap.")
         return
 
-    await update.message.reply_text("👇 Use the menu:", reply_markup=main_menu())
-
-# ─── LEADERBOARD DISPLAYS ────────────────────────────
-
-async def show_leaderboard(query):
-    weekly = get_weekly_leaderboard(3)
-    all_t  = get_all_time_leaderboard(10)
-
-    week_text = "🏆 *This Week's Top 3:*\n"
-    for i, r in enumerate(weekly[:3], 1):
-        stars = f" ⭐{WEEKLY_PRIZES[i]}" if i in WEEKLY_PRIZES else ""
-        week_text += f"{medal(i)} {r['first_name'] or r['username']} — *{r['weekly_points']} pts*{stars}\n"
-    if not weekly:
-        week_text += "_No predictions this week_\n"
-
-    all_text = "\n📊 *All-Time Top 10:*\n"
-    for i, r in enumerate(all_t, 1):
-        all_text += f"{medal(i)} {r['first_name'] or r['username']} — *{r['total_points']} pts*\n"
-    if not all_t:
-        all_text += "_No predictions yet_\n"
-
-    await query.edit_message_text(
-        week_text + all_text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📅 Weekly Board",   callback_data="leaderboard_weekly")],
-            [InlineKeyboardButton("🏠 Main Menu",      callback_data="main_menu")],
-        ])
-    )
-
-
-async def show_weekly_leaderboard(query):
-    rows = get_weekly_leaderboard(10)
-    text = "📅 *Weekly Leaderboard:*\n\n"
-    for i, r in enumerate(rows, 1):
-        stars = f" — ⭐{WEEKLY_PRIZES[i]}" if i in WEEKLY_PRIZES else ""
-        text += f"{medal(i)} {r['first_name'] or r['username']} — *{r['weekly_points']} pts*{stars}\n"
-    if not rows:
-        text += "_No predictions this week_"
-    text += "\n\n🔄 Resets every *Monday 12 AM IST*"
-
-    await query.edit_message_text(
-        text, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌐 All-Time Board", callback_data="leaderboard_alltime")],
-            [InlineKeyboardButton("🏠 Main Menu",      callback_data="main_menu")],
-        ])
-    )
-
-# ─── ADMIN COMMANDS ───────────────────────────────────
-
-async def cmd_setstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: `/setstock RELIANCE`", parse_mode="Markdown")
-        return
-
-    symbol = context.args[0].upper()
-    price  = get_stock_price(symbol)
-    if price is None:
-        await update.message.reply_text(f"❌ Could not fetch *{symbol}*. Check symbol.", parse_mode="Markdown")
-        return
-
-    set_today_challenge_fixed(symbol)
-    msg = (
-        f"📢 *Today's Prediction Challenge!*\n\n"
-        f"📌 Stock: *{symbol}*\n"
-        f"💰 Current: *₹{price}*\n\n"
-        f"🎯 Predict today's *closing price*!\n"
-        f"⏰ Deadline: *9:00 AM IST*\n\n"
-        "Use /start → 🎯 Predict Today"
-    )
-    sent, failed = await broadcast(context, msg)
-    await update.message.reply_text(
-        f"✅ Stock set: *{symbol}* (₹{price})\n📢 Sent: {sent} | Failed: {failed}",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only.")
-        return
-
-    challenge = get_today_challenge()
-    if not challenge:
-        await update.message.reply_text("❌ No challenge today.")
-        return
-    if challenge["is_settled"]:
-        await update.message.reply_text("✅ Already settled today.")
-        return
-
-    closing = get_closing_price(challenge["symbol"])
-    if closing is None:
+    # ADMIN BROADCAST
+    if user_id == ADMIN_ID and admin_broadcast_mode.get(ADMIN_ID):
+        admin_broadcast_mode.pop(ADMIN_ID, None)
+        user_ids = get_all_user_ids()
+        success = 0
+        failed = 0
+        await update.message.reply_text(f"Broadcasting to {len(user_ids)} users...")
+        for uid in user_ids:
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"Message from StockTap:\n\n{text}"
+                )
+                success += 1
+            except Exception:
+                failed += 1
         await update.message.reply_text(
-            f"❌ Could not auto-fetch closing for *{challenge['symbol']}*.\n\n"
-            "Use: `/setclosing <price>`",
-            parse_mode="Markdown"
+            f"Broadcast done!\nSent: {success}\nFailed: {failed}"
         )
         return
 
-    await _do_settlement(update, context, closing)
-
-
-async def cmd_setclosing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: `/setclosing 24500.50`", parse_mode="Markdown")
-        return
-    try:
-        closing = float(context.args[0].replace(",", ""))
-    except ValueError:
-        await update.message.reply_text("❌ Invalid price.")
-        return
-
-    challenge = get_today_challenge()
-    if not challenge:
-        await update.message.reply_text("❌ No challenge today.")
-        return
-    await _do_settlement(update, context, closing)
-
-
-async def _do_settlement(update, context, closing_price: float):
-    challenge   = get_today_challenge()
-    symbol      = challenge["symbol"]
-
-    settle_challenge(closing_price)
-    predictions = get_all_today_predictions()
-    results     = []
-
-    for pred in predictions:
-        pts = calculate_points(pred["predicted_price"], closing_price)
-        save_prediction_points(pred["id"], pts)
-        add_points(pred["user_id"], pts)
-        results.append({
-            "user_id":    pred["user_id"],
-            "first_name": pred["first_name"] or pred["username"] or "User",
-            "predicted":  pred["predicted_price"],
-            "points":     pts,
-        })
-
-    results.sort(key=lambda x: x["points"], reverse=True)
-
-    # Broadcast top results
-    result_text = (
-        f"📊 *Results: {symbol}*\n"
-        f"✅ Closing: *₹{closing_price}*\n\n"
-        f"🏆 *Today's Top 5:*\n"
-    )
-    for i, r in enumerate(results[:5], 1):
-        result_text += f"{medal(i)} {r['first_name']} — ₹{r['predicted']} → *{r['points']} pts*\n"
-    result_text += f"\n📈 {len(predictions)} total predictions today!"
-
-    await broadcast(context, result_text)
-
-    # Personal notifications
-    for pred in predictions:
-        pts  = calculate_points(pred["predicted_price"], closing_price)
-        diff = abs(pred["predicted_price"] - closing_price)
-        emoji = "🎯" if pts == 1000 else "⭐" if pts >= 700 else "👍" if pts > 0 else "😔"
-        try:
-            await context.bot.send_message(
-                chat_id=pred["user_id"],
-                text=(
-                    f"📊 *Your Result — {symbol}*\n\n"
-                    f"Your guess:  *₹{pred['predicted_price']}*\n"
-                    f"Closing:     *₹{closing_price}*\n"
-                    f"Difference:  *₹{round(diff, 2)}*\n\n"
-                    f"Points: *{pts}* {emoji}"
-                ),
-                parse_mode="Markdown",
-                reply_markup=main_menu()
+    # PREDICTION PRICE INPUT
+    if user_id in user_state and user_state[user_id].get("step") == "waiting_price":
+        if is_market_open():
+            user_state.pop(user_id, None)
+            await update.message.reply_text(
+                "Market is open! No predictions accepted.",
+                reply_markup=main_menu_keyboard(user_id)
             )
-        except Exception as e:
-            logger.warning(f"Personal notify failed {pred['user_id']}: {e}")
+            return
 
+        try:
+            predicted_price = float(text.replace(",", ""))
+        except ValueError:
+            await update.message.reply_text(
+                "Invalid price! Enter numbers only.\nExample: 22500 or 22500.50"
+            )
+            return
+
+        state = user_state[user_id]
+        symbol = state["symbol"]
+        prediction_date = state["date"]
+
+        # Double check limit
+        premium = is_premium(user_id)
+        limit = 2 if premium else 1
+        used = get_predictions_today(user_id, prediction_date)
+
+        if used >= limit:
+            user_state.pop(user_id, None)
+            await update.message.reply_text(
+                f"You have used all {limit} predictions for today!",
+                reply_markup=main_menu_keyboard(user_id)
+            )
+            return
+
+        add_prediction(user_id, symbol, predicted_price, prediction_date)
+        user_state.pop(user_id, None)
+
+        remaining = limit - used - 1
+        premium = is_premium(user_id)
+
+        await update.message.reply_text(
+            f"Prediction saved!\n\n"
+            f"Stock: {symbol}\n"
+            f"Your prediction: Rs {predicted_price}\n"
+            f"Date: {prediction_date}\n\n"
+            f"Predictions remaining today: {remaining}/{limit}\n\n"
+            f"Results announced at 3:31 PM IST!\n"
+            f"Good luck!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Predict Another", callback_data="predict")] if remaining > 0 else
+                [InlineKeyboardButton("View Leaderboard", callback_data="leaderboard")],
+                [InlineKeyboardButton("My Predictions", callback_data="mypredictions")],
+                [InlineKeyboardButton("Main Menu", callback_data="menu_main")]
+            ])
+        )
+        return
+
+    # DEFAULT
     await update.message.reply_text(
-        f"✅ Settled *{symbol}* @ ₹{closing_price}\n"
-        f"Predictions processed: {len(predictions)}",
-        parse_mode="Markdown"
+        "Use the menu to get started:",
+        reply_markup=main_menu_keyboard(user_id)
     )
 
+# -------------------- PAYMENT --------------------
 
-async def cmd_weeklyreward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only.")
-        return
-    await do_weekly_reward(context)
-    await update.message.reply_text("✅ Weekly reward triggered!")
+async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    if query.invoice_payload == "stocktap_premium":
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="Something went wrong!")
 
-
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: `/broadcast <message>`", parse_mode="Markdown")
-        return
-    msg = " ".join(context.args)
-    sent, failed = await broadcast(context, f"📢 {msg}")
-    await update.message.reply_text(f"✅ Sent: {sent} | Failed: {failed}")
-
-
-async def cmd_adminhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+async def payment_success(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    set_premium(user_id)
     await update.message.reply_text(
-        "🔧 *Admin Commands:*\n\n"
-        "/setstock <SYMBOL>    — Set today's stock + broadcast\n"
-        "/settle               — Auto-fetch closing + settle\n"
-        "/setclosing <price>   — Manual closing price + settle\n"
-        "/weeklyreward         — Trigger weekly reward now\n"
-        "/broadcast <msg>      — Message all users\n"
-        "/adminhelp            — This help",
-        parse_mode="Markdown"
+        "Payment successful!\n\n"
+        "You are now a StockTap Premium member!\n\n"
+        "2 predictions/day + 1.5x points activated!",
+        reply_markup=main_menu_keyboard(user_id)
     )
 
-# ─── BROADCAST ───────────────────────────────────────
+# -------------------- SCHEDULED JOBS --------------------
 
-async def broadcast(context, message: str) -> tuple:
-    user_ids        = get_all_user_ids()
-    sent = failed   = 0
+async def announce_results(context):
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return
+
+    if not (now.hour == 15 and now.minute >= 31):
+        return
+
+    prices = get_all_closing_prices()
+    if not prices:
+        print("Could not fetch closing prices")
+        return
+
+    today = now.date()
+    predictions = get_all_predictions_for_date(today)
+
+    if not predictions:
+        return
+
+    results_text = (
+        f"StockTap Results - {today}\n\n"
+        f"Actual Closing Prices:\n"
+    )
+    for symbol, price in prices.items():
+        results_text += f"{symbol}: Rs {price}\n"
+    results_text += "\nCalculating your points now..."
+
+    user_ids = get_all_user_ids()
     for uid in user_ids:
         try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text=message,
-                parse_mode="Markdown",
-                reply_markup=main_menu()
-            )
-            sent += 1
-        except Exception as e:
-            logger.warning(f"Broadcast failed {uid}: {e}")
-            failed += 1
-    return sent, failed
-
-# ─── WEEKLY REWARD ────────────────────────────────────
-
-async def do_weekly_reward(context):
-    today      = date.today()
-    week_start = str(today - timedelta(days=today.weekday()))
-    week_end   = str(today)
-    top3       = get_weekly_leaderboard(3)
-
-    if not top3:
-        logger.info("No weekly data.")
-        return
-
-    announce = "🏆 *Weekly Results!*\n\n"
-    for i, r in enumerate(top3, 1):
-        stars = WEEKLY_PRIZES.get(i, 0)
-        name  = r["first_name"] or r["username"] or "User"
-        announce += (
-            f"{medal(i)} *{name}*\n"
-            f"   Points: *{r['weekly_points']}*\n"
-            f"   Prize:  *{stars} ⭐ Stars*\n\n"
-        )
-        log_weekly_reward(week_start, week_end, i, r["user_id"],
-                          r["username"], r["weekly_points"], stars)
-        try:
-            await context.bot.send_message(
-                chat_id=r["user_id"],
-                text=(
-                    f"🎉 *Congratulations {name}!*\n\n"
-                    f"You finished *#{i}* this week!\n"
-                    f"Prize: *{stars} ⭐ Stars*\n\n"
-                    "Stars will be sent by admin shortly. 🚀"
-                ),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.warning(f"Winner notify failed {r['user_id']}: {e}")
-
-    announce += "🔄 Weekly reset! Good luck next week 💪"
-    await broadcast(context, announce)
-
-    # Admin summary
-    admin_msg = "⭐ *Send Stars to Winners:*\n\n"
-    for i, r in enumerate(top3, 1):
-        admin_msg += f"{medal(i)} `{r['user_id']}` — {WEEKLY_PRIZES.get(i,0)} Stars\n"
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_msg, parse_mode="Markdown")
-    except Exception:
-        pass
-
-    reset_weekly_points()
-    logger.info("✅ Weekly rewards done!")
-
-# ─── SCHEDULED JOBS ───────────────────────────────────
-
-async def job_lock_predictions(context: ContextTypes.DEFAULT_TYPE):
-    challenge = get_today_challenge()
-    if challenge and not challenge["is_locked"]:
-        lock_today_challenge()
-        logger.info("✅ Locked predictions at 9 AM IST")
-        await broadcast(
-            context,
-            f"🔒 *Predictions Locked!*\n\n"
-            f"Stock: *{challenge['symbol']}*\n"
-            "Market is open. Results after 3:30 PM IST 📊"
-        )
-
-
-async def job_settle_market(context: ContextTypes.DEFAULT_TYPE):
-    challenge = get_today_challenge()
-    if not challenge or challenge["is_settled"]:
-        return
-
-    symbol  = challenge["symbol"]
-    closing = get_closing_price(symbol)
-
-    if closing is None:
-        logger.warning(f"Auto-settle failed for {symbol}")
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=f"⚠️ Auto-settle failed for *{symbol}*.\nUse `/setclosing <price>`",
-                parse_mode="Markdown"
-            )
+            await context.bot.send_message(chat_id=uid, text=results_text)
         except Exception:
             pass
-        return
 
-    settle_challenge(closing)
-    predictions = get_all_today_predictions()
-    results     = []
+    for prediction in predictions:
+        symbol = prediction["stock_symbol"]
+        actual = prices.get(symbol)
+        if not actual:
+            continue
 
-    for pred in predictions:
-        pts = calculate_points(pred["predicted_price"], closing)
-        save_prediction_points(pred["id"], pts)
-        add_points(pred["user_id"], pts)
-        results.append({
-            "user_id":    pred["user_id"],
-            "first_name": pred["first_name"] or pred["username"] or "User",
-            "predicted":  pred["predicted_price"],
-            "points":     pts,
-        })
+        predicted = prediction["predicted_price"]
+        points = calculate_points(predicted, actual)
 
-    results.sort(key=lambda x: x["points"], reverse=True)
+        premium = is_premium(prediction["user_id"])
+        if premium:
+            points = round(points * 1.5, 2)
 
-    result_text = (
-        f"📊 *Results: {symbol}*\n"
-        f"✅ Closing: *₹{closing}*\n\n"
-        f"🏆 *Today's Top 5:*\n"
-    )
-    for i, r in enumerate(results[:5], 1):
-        result_text += f"{medal(i)} {r['first_name']} — ₹{r['predicted']} → *{r['points']} pts*\n"
-    result_text += f"\n📈 {len(predictions)} predictions today!"
+        evaluate_prediction(prediction["id"], actual, points)
+        update_user_points(prediction["user_id"], points)
 
-    await broadcast(context, result_text)
-
-    for pred in predictions:
-        pts  = calculate_points(pred["predicted_price"], closing)
-        diff = abs(pred["predicted_price"] - closing)
-        emoji = "🎯" if pts == 1000 else "⭐" if pts >= 700 else "👍" if pts > 0 else "😔"
         try:
             await context.bot.send_message(
-                chat_id=pred["user_id"],
+                chat_id=prediction["user_id"],
                 text=(
-                    f"📊 *Your Result — {symbol}*\n\n"
-                    f"Guess:       *₹{pred['predicted_price']}*\n"
-                    f"Closing:     *₹{closing}*\n"
-                    f"Difference:  *₹{round(diff, 2)}*\n\n"
-                    f"Points: *{pts}* {emoji}"
+                    f"Your Result for {symbol}:\n\n"
+                    f"Your prediction: Rs {predicted}\n"
+                    f"Actual closing: Rs {actual}\n"
+                    f"Points earned: {points}\n\n"
+                    f"{'1.5x Premium bonus applied!' if premium else ''}\n"
+                    f"Check leaderboard to see your rank!"
                 ),
-                parse_mode="Markdown",
-                reply_markup=main_menu()
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("View Leaderboard", callback_data="leaderboard")]
+                ])
             )
         except Exception as e:
-            logger.warning(f"Personal notify failed {pred['user_id']}: {e}")
+            print(f"Error sending result to {prediction['user_id']}: {e}")
 
-    logger.info(f"✅ Auto-settled {symbol} @ ₹{closing}")
+async def weekly_reset(context):
+    now = datetime.now(IST)
+    if now.weekday() != 6 or now.hour != 20:
+        return
 
+    leaders = get_weekly_leaderboard()
 
-async def job_weekly_reward(context: ContextTypes.DEFAULT_TYPE):
-    await do_weekly_reward(context)
+    if not leaders:
+        return
 
-# ─── MAIN ─────────────────────────────────────────────
+    week_end = now.date()
+    week_start = week_end - timedelta(days=6)
+    save_weekly_winners(week_start, week_end, leaders)
+
+    announcement = "Weekly Results!\n\nTop 3 winners this week:\n\n"
+    prizes = [100, 50, 25]
+    medals = ["1st", "2nd", "3rd"]
+
+    for i, leader in enumerate(leaders[:3]):
+        name = leader["first_name"] or leader["username"] or "Unknown"
+        username = f"@{leader['username']}" if leader["username"] else ""
+        announcement += (
+            f"{medals[i]}: {name} {username}\n"
+            f"Points: {round(leader['weekly_points'], 2)}\n"
+            f"Prize: {prizes[i]} Telegram Stars\n\n"
+        )
+
+    announcement += (
+        "Winners will receive their Stars shortly!\n\n"
+        "New week starts now - predict again!"
+    )
+
+    user_ids = get_all_user_ids()
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=announcement)
+        except Exception:
+            pass
+
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            f"Weekly reset done!\n\n"
+            f"Send Stars to winners manually:\n\n"
+            + "\n".join([
+                f"{medals[i]}: {leaders[i]['user_id']} "
+                f"(@{leaders[i]['username']}) - {prizes[i]} Stars"
+                for i in range(min(3, len(leaders)))
+            ])
+        )
+    )
+
+    reset_weekly_points()
+
+# -------------------- ADMIN COMMANDS --------------------
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Unknown command.")
+        return
+    stats = get_stats()
+    await update.message.reply_text(
+        f"StockTap Stats\n\n"
+        f"Total users: {stats['total_users']}\n"
+        f"Premium users: {stats['premium_users']}\n"
+        f"Free users: {stats['free_users']}\n"
+        f"Total predictions: {stats['total_predictions']}\n"
+        f"New today: {stats['new_today']}"
+    )
+
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Unknown command.")
+        return
+    users = get_all_users()
+    text = f"All Users ({len(users)}):\n\n"
+    for u in users[:20]:
+        username = f"@{u['username']}" if u['username'] else "No username"
+        plan = "PREMIUM" if u['is_premium'] else "FREE"
+        banned = " BANNED" if u['is_banned'] else ""
+        text += (
+            f"ID: {u['user_id']}\n"
+            f"Name: {u['first_name']} ({username})\n"
+            f"Plan: {plan}{banned}\n"
+            f"Weekly pts: {round(u['weekly_points'], 2)}\n\n"
+        )
+    if len(users) > 20:
+        text += f"...and {len(users) - 20} more"
+    await update.message.reply_text(text)
+
+async def admin_makepremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Unknown command.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /makepremium <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+        set_premium(target_id)
+        await update.message.reply_text(f"User {target_id} is now Premium!")
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="You have been upgraded to Premium by admin!\n2 predictions/day + 1.5x points!"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def admin_removepremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Unknown command.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /removepremium <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+        remove_premium(target_id)
+        await update.message.reply_text(f"Premium removed from {target_id}.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Unknown command.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /ban <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+        ban_user(target_id)
+        await update.message.reply_text(f"User {target_id} banned.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Unknown command.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /unban <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+        unban_user(target_id)
+        await update.message.reply_text(f"User {target_id} unbanned.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def admin_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Unknown command.")
+        return
+    admin_broadcast_mode[ADMIN_ID] = True
+    await update.message.reply_text(
+        "Broadcast mode ON\n\nType your message to send to all users.\n"
+        "Type /cancelbroadcast to cancel."
+    )
+
+async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    admin_broadcast_mode.pop(ADMIN_ID, None)
+    await update.message.reply_text("Broadcast cancelled.")
+
+async def admin_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Unknown command.")
+        return
+    leaders = get_weekly_leaderboard()
+    if not leaders:
+        await update.message.reply_text("No leaders yet.")
+        return
+    text = "Current Weekly Leaderboard:\n\n"
+    for i, l in enumerate(leaders):
+        text += (
+            f"{i+1}. {l['first_name']} (@{l['username']})\n"
+            f"   ID: {l['user_id']}\n"
+            f"   Points: {round(l['weekly_points'], 2)}\n\n"
+        )
+    await update.message.reply_text(text)
+
+# -------------------- MAIN --------------------
 
 def main():
     init_db()
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # User commands
     app.add_handler(CommandHandler("start", start))
 
     # Admin commands
-    app.add_handler(CommandHandler("setstock",     cmd_setstock))
-    app.add_handler(CommandHandler("settle",       cmd_settle))
-    app.add_handler(CommandHandler("setclosing",   cmd_setclosing))
-    app.add_handler(CommandHandler("weeklyreward", cmd_weeklyreward))
-    app.add_handler(CommandHandler("broadcast",    cmd_broadcast))
-    app.add_handler(CommandHandler("adminhelp",    cmd_adminhelp))
+    app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(CommandHandler("users", admin_users))
+    app.add_handler(CommandHandler("makepremium", admin_makepremium))
+    app.add_handler(CommandHandler("removepremium", admin_removepremium))
+    app.add_handler(CommandHandler("ban", admin_ban))
+    app.add_handler(CommandHandler("unban", admin_unban))
+    app.add_handler(CommandHandler("broadcast", admin_broadcast_cmd))
+    app.add_handler(CommandHandler("cancelbroadcast", cancel_broadcast))
+    app.add_handler(CommandHandler("adminleaderboard", admin_leaderboard))
 
-    # Callbacks + text
-    app.add_handler(CallbackQueryHandler(callback_router))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, payment_success))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Scheduled jobs (UTC times)
-    jq = app.job_queue
+    # Check results every minute
+    app.job_queue.run_repeating(announce_results, interval=60, first=10)
 
-    # Lock at 9:00 AM IST = 3:30 AM UTC
-    jq.run_daily(job_lock_predictions, time=time(3, 30, tzinfo=pytz.utc), name="lock")
+    # Weekly reset check every hour
+    app.job_queue.run_repeating(weekly_reset, interval=3600, first=30)
 
-    # Settle at 3:35 PM IST = 10:05 AM UTC
-    jq.run_daily(job_settle_market, time=time(10, 5, tzinfo=pytz.utc), name="settle")
-
-    # Weekly reward: Monday 12:00 AM IST = Sunday 6:30 PM UTC
-    jq.run_daily(job_weekly_reward, time=time(18, 30, tzinfo=pytz.utc), days=(6,), name="weekly")
-
-    logger.info("🚀 StockPredictor LIVE on Railway!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    print("StockTap is LIVE!")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
